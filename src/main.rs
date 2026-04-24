@@ -1,8 +1,5 @@
 use clap::{Parser};
 use anyhow::Result;
-use std::collections::HashMap;
-use regex::Regex;
-use glob::Pattern;
 
 #[derive(Parser)]
 #[command(name = "git-filter-repo")]

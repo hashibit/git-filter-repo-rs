@@ -1,134 +1,192 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::Path;
 use regex::Regex;
 use glob::Pattern;
 
 #[derive(Parser)]
 #[command(name = "git-filter-repo")]
 #[command(about = "A tool for rewriting repository history", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+struct Args {
+    /// Analyze repository history and create a report that may be useful in determining what to filter in a subsequent run. Will not modify your repo.
+    #[arg(long)]
+    analyze: bool,
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Analyze repository history and create a report
-    #[command(arg_required_else_help = true)]
-    Analyze {
-        /// Directory to write report to
-        #[arg(long, default_value = "analysis_report")]
-        report_dir: String,
-    },
+    /// Directory to write report, defaults to GIT_DIR/filter_repo/analysis,refuses to run if exists, --force delete existing dir first.
+    #[arg(long)]
+    report_dir: Option<String>,
 
-    /// Filter repository history based on specified rules
-    #[command(arg_required_else_help = true)]
-    Filter {
-        /// Paths to include in filtered history
-        #[arg(long, value_name = "PATH")]
-        path: Vec<String>,
+    /// Exact paths (files or directories) to include in filtered history. Multiple --path options can be specified to get a union of paths.
+    #[arg(long = "path", value_name = "DIR_OR_FILE")]
+    paths: Vec<String>,
 
-        /// Globs of paths to include in filtered history
-        #[arg(long, value_name = "GLOB")]
-        path_glob: Vec<String>,
+    /// Glob of paths to include in filtered history. Multiple --path-glob options can be specified to get a union of paths.
+    #[arg(long = "path-glob", value_name = "GLOB")]
+    path_globs: Vec<String>,
 
-        /// Regex of paths to include in filtered history
-        #[arg(long, value_name = "REGEX")]
-        path_regex: Vec<String>,
+    /// Regex of paths to include in filtered history. Multiple --path-regex options can be specified to get a union of paths
+    #[arg(long = "path-regex", value_name = "REGEX")]
+    path_regexes: Vec<String>,
 
-        /// Invert the selection of files from path options
-        #[arg(long)]
-        invert_paths: bool,
+    /// Invert the selection of files from the specified --path-{match,glob,regex} options below, i.e. only select files matching none of those options.
+    #[arg(long)]
+    invert_paths: bool,
 
-        /// Match on file base name instead of full path
-        #[arg(long)]
-        use_base_name: bool,
+    /// Match on file base name instead of full path from the top of the repo. Incompatible with --path-rename, and incompatible with matching against directory names.
+    #[arg(long)]
+    use_base_name: bool,
 
-        /// Exact paths to rename
-        #[arg(long, value_name = "OLD_PATH:NEW_PATH", value_parser = parse_rename)]
-        path_rename: Vec<(String, String)>,
+    /// Path to rename; if filename or directory matches OLD_NAME rename to NEW_NAME. Multiple --path-rename options can be specified. NOTE: If you combine filtering options with renaming ones, do not rely on a rename argument to select paths; you also need a filter to select them.
+    #[arg(long = "path-rename", value_name = "OLD_NAME:NEW_NAME", value_parser = parse_rename)]
+    path_renames: Vec<(String, String)>,
 
-        /// Extract history of a subdirectory and treat as project root
-        #[arg(long, value_name = "DIRECTORY")]
-        subdirectory_filter: Option<String>,
+    /// Specify several path filtering and renaming directives, one per line. Lines with '==' in them specify path renames, and lines can begin with 'literal:' (the default), 'glob:', or 'regex:' to specify different matching styles. Blank lines and lines starting with a '#' are ignored.
+    #[arg(long, value_name = "FILENAME")]
+    paths_from_file: Option<String>,
 
-        /// Treat project root as if under specified directory
-        #[arg(long, value_name = "DIRECTORY")]
-        to_subdirectory_filter: Option<String>,
+    /// Only look at history that touches the given subdirectory and treat that directory as the project root. Equivalent to using '--path DIRECTORY/ --path-rename DIRECTORY/:'
+    #[arg(long, value_name = "DIRECTORY")]
+    subdirectory_filter: Option<String>,
 
-        /// File with expressions to replace in content
-        #[arg(long, value_name = "FILE")]
-        replace_text: Option<String>,
+    /// Treat the project root as if it were under DIRECTORY. Equivalent to using '--path-rename :DIRECTORY/'
+    #[arg(long, value_name = "DIRECTORY")]
+    to_subdirectory_filter: Option<String>,
 
-        /// Strip blobs bigger than specified size
-        #[arg(long, value_name = "SIZE")]
-        strip_blobs_bigger_than: Option<String>,
+    /// A file with expressions that, if found, will be replaced. By default, each expression is treated as literal text, but 'regex:' and 'glob:' prefixes are supported. You can end the line with '==' and some replacement text to choose a replacement choice other than the default of '***REMOVED***'.
+    #[arg(long, value_name = "EXPRESSIONS_FILE")]
+    replace_text: Option<String>,
 
-        /// Rename tags
-        #[arg(long, value_name = "OLD:NEW", value_parser = parse_rename)]
-        tag_rename: Vec<(String, String)>,
+    /// Strip blobs (files) bigger than specified size (e.g. '5M', '2G', etc)
+    #[arg(long, value_name = "SIZE")]
+    strip_blobs_bigger_than: Option<String>,
 
-        /// Force rewriting even if not in a fresh clone
-        #[arg(short, long)]
-        force: bool,
+    /// Read git object ids from each line of the given file, and strip all of them from history
+    #[arg(long, value_name = "BLOB-ID-FILENAME")]
+    strip_blobs_with_ids: Option<String>,
 
-        /// Dry run without changing the repository
-        #[arg(long)]
-        dry_run: bool,
+    /// Rename tags starting with OLD to start with NEW. For example, --tag-rename foo:bar will rename tag foo-1.2.3 to bar-1.2.3; either OLD or NEW can be empty.
+    #[arg(long = "tag-rename", value_name = "OLD:NEW", value_parser = parse_rename)]
+    tag_renames: Vec<(String, String)>,
 
-        /// Quiet mode
-        #[arg(long)]
-        quiet: bool,
+    /// A file with expressions that, if found in commit or tag messages, will be replaced. This file uses the same syntax as --replace-text.
+    #[arg(long, value_name = "EXPRESSIONS_FILE")]
+    replace_message: Option<String>,
 
-        /// Prune empty commits
-        #[arg(long, value_name = "WHEN", default_value = "auto")]
-        prune_empty: String,
+    /// By default, since commits are rewritten and thus gain new hashes, references to old commit hashes in commit messages are replaced with new commit hashes (abbreviated to the same length as the old reference). Use this flag to turn off updating commit hashes in commit messages.
+    #[arg(long)]
+    preserve_commit_hashes: bool,
 
-        /// Preserve commit hashes in commit messages
-        #[arg(long)]
-        preserve_commit_hashes: bool,
-    },
+    /// Do not reencode commit messages into UTF-8. By default, if the commit object specifies an encoding for the commit message, the message is re-encoded into UTF-8.
+    #[arg(long)]
+    preserve_commit_encoding: bool,
 
-    /// Delete files from history that match current gitignore rules
-    CleanIgnore,
+    /// Use specified mailmap file (see git-shortlog(1) for details on the format) when rewriting author, committer, and tagger names and emails. If the specified file is part of git history, historical versions of the file will be ignored; only the current contents are consulted.
+    #[arg(long, value_name = "FILENAME")]
+    mailmap: Option<String>,
 
-    /// Run a command on all non-binary files in history (linting, etc.)
-    LintHistory {
-        /// Command to run on each file (with the file path as an argument)
-        #[arg(required = true, num_args = 1..)]
-        command: Vec<String>,
-    },
+    /// Same as: '--mailmap .mailmap'
+    #[arg(long)]
+    use_mailmap: bool,
 
-    /// Add a new file to the beginning of history
-    InsertBeginning {
-        /// Path to the file to insert
-        #[arg(value_name = "FILE")]
-        file_path: String,
+    /// How to handle replace refs (see git-replace(1)). Replace refs can be added during the history rewrite as a way to allow users to pass old commit IDs (from before git-filter-repo was run) to git commands and have git know how to translate those old commit IDs to the new (post-rewrite) commit IDs. Also, replace refs that existed before the rewrite can either be deleted or updated. The choices to pass to --replace-refs thus need to specify both what to do with existing refs and what to do with commit rewrites. Thus 'update-and-add' means to update existing replace refs, and for any commit rewrite (even if already pointed at by a replace ref) add a new refs/replace/ reference to map from the old commit ID to the new commit ID. The default is update-no-add, meaning update existing replace refs but do not add any new ones. There is also a special 'old-default' option for picking the default used in versions prior to git-filter-repo-2.45, namely 'update-and-add' upon the first run of git-filter-repo in a repository and 'update-or-add' if running git-filter-repo again on a repository.
+    #[arg(long, value_enum, default_value_t = ReplaceRefsOption::UpdateNoAdd)]
+    replace_refs: ReplaceRefsOption,
 
-        /// Content of the file to insert
-        #[arg(value_name = "CONTENT")]
-        content: String,
+    /// Whether to prune empty commits. 'auto' (the default) means only prune commits which become empty (not commits which were empty in the original repo, unless their parent was pruned). When the parent of a commit is pruned, the first non-pruned ancestor becomes the new parent.
+    #[arg(long, value_enum, default_value_t = PruneEmptyOption::Auto)]
+    prune_empty: PruneEmptyOption,
 
-        /// Commit message for the initial commit
-        #[arg(long, default_value = "Add initial file")]
-        message: String,
-    },
+    /// Since merge commits are needed for history topology, they are typically exempt from pruning. However, they can become degenerate with the pruning of other commits (having fewer than two parents, having one commit serve as both parents, or having one parent as the ancestor of the other.) If such merge commits have no file changes, they can be pruned. The default ('auto') is to only prune empty merge commits which become degenerate (not which started as such).
+    #[arg(long, value_enum, default_value_t = PruneDegenerateOption::Auto)]
+    prune_degenerate: PruneDegenerateOption,
 
-    /// Add Signed-off-by tags to commits
-    SignedOffBy {
-        /// Name and email for the Signed-off-by tag
-        #[arg(long)]
-        signature: String,
+    /// Even if the first parent is or becomes an ancestor of another parent, do not prune it. This modifies how --prune-degenerate behaves, and may be useful in projects who always use merge --no-ff.
+    #[arg(long)]
+    no_ff: bool,
 
-        /// Range of commits to process (defaults to all)
-        #[arg(long)]
-        commits: Option<String>,
-    },
+    /// This rewrite is intended to remove sensitive data from a repository. Gather extra information from the rewrite needed to provide additional instructions on how to clean up other copies.
+    #[arg(long, alias = "sdr")]
+    sensitive_data_removal: bool,
+
+    /// By default, --sensitive-data-removal will trigger a mirror-like fetch of all refs from origin, discarding local changes, but ensuring that _all_ fetchable refs that hold on to the sensitve data are rewritten. This flag removes that fetch, risking that other refs continue holding on to the sensitive data. This option is implied by --partial or any flag that implies --partial.
+    #[arg(long)]
+    no_fetch: bool,
+
+    /// Git repository to read from
+    #[arg(long, value_name = "SOURCE")]
+    source: Option<String>,
+
+    /// Git repository to overwrite with filtered history
+    #[arg(long, value_name = "TARGET")]
+    target: Option<String>,
+
+    /// Processes commits in commit timestamp order.
+    #[arg(long)]
+    date_order: bool,
 
     /// Show the version
-    Version,
+    #[arg(long)]
+    version: bool,
+
+    /// Avoid triggering the no-arguments-specified check.
+    #[arg(long)]
+    proceed: bool,
+
+    /// Rewrite repository history even if the current repo does not look like a fresh clone. History rewriting is irreversible (and includes immediate pruning of reflogs and old objects), so be cautious about using this flag.
+    #[arg(short, long)]
+    force: bool,
+
+    /// Do a partial history rewrite, resulting in the mixture of old and new history. This disables rewriting refs/remotes/origin/* to refs/heads/*, disables removing of the 'origin' remote, disables removing unexported refs, disables expiring the reflog, and disables the automatic post-filter gc. Also, this modifies --tag-rename and --refname-callback options such that instead of replacing old refs with new refnames, it will instead create new refs and keep the old ones around. Use with caution.
+    #[arg(long)]
+    partial: bool,
+
+    /// Do not run 'git gc' after filtering.
+    #[arg(long)]
+    no_gc: bool,
+
+    /// Limit history rewriting to the specified refs. Implies --partial. In addition to the normal caveats of --partial (mixing old and new history, no automatic remapping of refs/remotes/origin/* to refs/heads/*, etc.), this also may cause problems for pruning of degenerate empty merge commits when negative revisions are specified.
+    #[arg(long, value_name = "REFS")]
+    refs: Vec<String>,
+
+    /// Do not change the repository. Run `git fast-export` and filter its output, and save both the original and the filtered version for comparison. This also disables rewriting commit messages due to not knowing new commit IDs and disables filtering of some empty commits due to inability to query the fast-import backend.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print additional information about operations being performed and commands being run. When used together with --dry-run, also show extra information about what would be run.
+    #[arg(long)]
+    debug: bool,
+
+    /// Instead of running `git fast-export` and filtering its output, filter the fast-export stream from stdin. The stdin must be in the expected input format (e.g. it needs to include original-oid directives).
+    #[arg(long)]
+    stdin: bool,
+
+    /// Pass --quiet to other git commands called
+    #[arg(long)]
+    quiet: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum ReplaceRefsOption {
+    DeleteNoAdd,
+    DeleteAndAdd,
+    UpdateNoAdd,
+    UpdateOrAdd,
+    UpdateAndAdd,
+    OldDefault,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum PruneEmptyOption {
+    Always,
+    Auto,
+    Never,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum PruneDegenerateOption {
+    Always,
+    Auto,
+    Never,
 }
 
 /// Parse a rename string in the format "old:new"
@@ -141,354 +199,84 @@ fn parse_rename(s: &str) -> Result<(String, String)> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = Args::parse();
 
-    match &cli.command {
-        Commands::Analyze { report_dir } => {
-            println!("Analyzing repository and writing report to {}", report_dir);
-            analyze_repository(report_dir)?;
-        }
-        Commands::Filter {
-            path,
-            path_glob,
-            path_regex,
-            invert_paths,
-            use_base_name,
-            path_rename,
-            subdirectory_filter,
-            to_subdirectory_filter,
-            replace_text,
-            strip_blobs_bigger_than,
-            tag_rename,
-            force,
-            dry_run,
-            quiet,
-            prune_empty,
-            preserve_commit_hashes,
-        } => {
-            if *quiet {
-                eprintln!("Filtering repository...");
-            } else {
-                println!("Filtering repository with options:");
-                println!("  Paths: {:?}", path);
-                println!("  Path globs: {:?}", path_glob);
-                println!("  Path regexes: {:?}", path_regex);
-                println!("  Invert paths: {}", invert_paths);
-                println!("  Use base name: {}", use_base_name);
-                println!("  Path renames: {:?}", path_rename);
-                println!("  Subdirectory filter: {:?}", subdirectory_filter);
-                println!("  To subdirectory filter: {:?}", to_subdirectory_filter);
-                println!("  Replace text file: {:?}", replace_text);
-                println!("  Strip blobs bigger than: {:?}", strip_blobs_bigger_than);
-                println!("  Tag renames: {:?}", tag_rename);
-                println!("  Force: {}", force);
-                println!("  Dry run: {}", dry_run);
-                println!("  Prune empty: {}", prune_empty);
-                println!("  Preserve commit hashes: {}", preserve_commit_hashes);
-            }
-
-            filter_repository(
-                path,
-                path_glob,
-                path_regex,
-                *invert_paths,
-                *use_base_name,
-                path_rename,
-                subdirectory_filter,
-                to_subdirectory_filter,
-                replace_text,
-                strip_blobs_bigger_than,
-                tag_rename,
-                *force,
-                *dry_run,
-                quiet,
-                prune_empty,
-                *preserve_commit_hashes,
-            )?;
-        }
-        Commands::CleanIgnore => {
-            println!("Cleaning files that match gitignore rules from history...");
-            clean_ignore()?;
-        }
-        Commands::LintHistory { command } => {
-            println!("Running lint command on files in history: {:?}", command);
-            lint_history(command)?;
-        }
-        Commands::InsertBeginning { file_path, content, message } => {
-            println!("Inserting file '{}' at the beginning of history", file_path);
-            insert_beginning(file_path, content, message)?;
-        }
-        Commands::SignedOffBy { signature, commits } => {
-            println!("Adding Signed-off-by to commits");
-            add_signed_off_by(signature, commits)?;
-        }
-        Commands::Version => {
-            println!("git-filter-repo version 1.0.0");
-        }
-    }
-
-    Ok(())
-}
-
-fn analyze_repository(report_dir: &str) -> Result<()> {
-    println!("Repository analysis starting...");
-
-    // In a real implementation, this would analyze the git repository and create reports
-    println!("Would analyze repository and create report in: {}", report_dir);
-    println!("Repository Analysis Report (simulated):");
-    println!("  Total commits: [would count commits]");
-    println!("  Total objects: [would count objects]");
-    println!("  Total size: [would calculate size]");
-
-    Ok(())
-}
-
-fn filter_repository(
-    paths: &[String],
-    path_globs: &[String],
-    path_regexes: &[String],
-    invert_paths: bool,
-    use_base_name: bool,
-    path_renames: &[(String, String)],
-    subdirectory_filter: &Option<String>,
-    to_subdirectory_filter: &Option<String>,
-    replace_text_file: &Option<String>,
-    strip_blobs_bigger_than: &Option<String>,
-    tag_renames: &[(String, String)],
-    force: bool,
-    dry_run: bool,
-    quiet: &bool,
-    prune_empty: &str,
-    preserve_commit_hashes: bool,
-) -> Result<()> {
-    if !*quiet {
-        println!("Initializing repository filtering...");
-    }
-
-    // Set up filtering criteria
-    let filter_config = FilterConfig {
-        paths: paths.to_vec(),
-        path_globs: path_globs.iter().map(|g| Pattern::new(g)).collect::<std::result::Result<Vec<_>, _>>()?,
-        path_regexes: path_regexes.iter().map(|r| Regex::new(r)).collect::<std::result::Result<Vec<_>, _>>()?,
-        invert_paths,
-        use_base_name,
-        path_renames: path_renames.to_vec(),
-        subdirectory_filter: subdirectory_filter.clone(),
-        to_subdirectory_filter: to_subdirectory_filter.clone(),
-        replace_text_rules: load_replace_text_rules(replace_text_file)?,
-        strip_blobs_bigger_than: parse_size(strip_blobs_bigger_than)?,
-        tag_renames: tag_renames.to_vec(),
-        prune_empty: prune_empty.to_string(),
-        preserve_commit_hashes,
-    };
-
-    if dry_run {
-        println!("Dry run mode - would filter repository with these options");
+    if args.version {
+        println!("git-filter-repo version 1.0.0");
         return Ok(());
     }
 
-    // In a real implementation, this would process the repository history
-    process_repository_history(&filter_config)?;
-
-    if !*quiet {
-        println!("Repository filtering completed successfully!");
-    }
-
-    Ok(())
-}
-
-fn clean_ignore() -> Result<()> {
-    println!("Cleaning files that match gitignore rules from history...");
-
-    // This would:
-    // 1. Read current .gitignore files
-    // 2. Identify which files in history match those patterns
-    // 3. Remove those files from all commits in history
-    // 4. Prune any commits that become empty as a result
-
-    println!("Would remove files matching gitignore rules from history");
-    println!("This includes:");
-    println!("  - Identifying files that match .gitignore patterns");
-    println!("  - Removing those files from all commits");
-    println!("  - Pruning commits that become empty");
-    println!("  - Rewriting commit hashes in commit messages");
-
-    Ok(())
-}
-
-fn lint_history(command: &[String]) -> Result<()> {
-    println!("Running lint command on all non-binary files in history...");
-
-    // This would:
-    // 1. Iterate through all commits and files in history
-    // 2. For each non-binary file, run the specified command on it
-    // 3. Potentially allow modifications to the file content during the process
-
-    println!("Would execute command {:?} on all non-binary files in history", command);
-    println!("This includes:");
-    println!("  - Checking each file to see if it's binary");
-    println!("  - Running the command on each non-binary file");
-    println!("  - Allowing the command to potentially modify the file");
-    println!("  - Preserving the modifications in the new history");
-
-    Ok(())
-}
-
-fn insert_beginning(file_path: &str, content: &str, message: &str) -> Result<()> {
-    println!("Inserting file '{}' at the beginning of history", file_path);
-
-    // This would:
-    // 1. Create a new initial commit with the specified file
-    // 2. Make all current commits descendants of this new initial commit
-
-    println!("Would insert file with content at the start of history");
-    println!("  File path: {}", file_path);
-    println!("  Content length: {} bytes", content.len());
-    println!("  Commit message: {}", message);
-    println!("  Operation: Create new root commit and rebase all existing commits onto it");
-
-    Ok(())
-}
-
-fn add_signed_off_by(signature: &str, commits: &Option<String>) -> Result<()> {
-    println!("Adding Signed-off-by tags to commits");
-
-    // This would:
-    // 1. Iterate through the specified commits
-    // 2. Add a "Signed-off-by: [signature]" line to each commit message
-    // 3. Preserve all other commit properties
-
-    println!("Would add Signed-off-by: {} to commits", signature);
-    println!("  Target commits: {:?}", commits.as_ref().unwrap_or(&"all".to_string()));
-    println!("  Operation: Append Signed-off-by line to commit messages");
-
-    Ok(())
-}
-
-struct FilterConfig {
-    paths: Vec<String>,
-    path_globs: Vec<Pattern>,
-    path_regexes: Vec<Regex>,
-    invert_paths: bool,
-    use_base_name: bool,
-    path_renames: Vec<(String, String)>,
-    subdirectory_filter: Option<String>,
-    to_subdirectory_filter: Option<String>,
-    replace_text_rules: Vec<ReplaceRule>,
-    strip_blobs_bigger_than: Option<u64>,
-    tag_renames: Vec<(String, String)>,
-    prune_empty: String,
-    preserve_commit_hashes: bool,
-}
-
-#[derive(Debug)]
-enum ReplaceRuleType {
-    Literal,
-    Regex,
-    Glob,
-}
-
-#[derive(Debug)]
-struct ReplaceRule {
-    rule_type: ReplaceRuleType,
-    pattern: String,
-    replacement: String,
-}
-
-fn load_replace_text_rules(file: &Option<String>) -> Result<Vec<ReplaceRule>> {
-    if let Some(filepath) = file {
-        // Load rules from file
-        let content = std::fs::read_to_string(filepath)?;
-        let mut rules = Vec::new();
-
-        for line in content.lines() {
-            if line.trim().is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let rule = parse_replace_rule(line)?;
-            rules.push(rule);
+    if args.analyze {
+        println!("Analyzing repository...");
+        analyze_repository(&args)?;
+    } else {
+        if !args.quiet {
+            println!("Filtering repository with options:");
+            println!("  Paths: {:?}", args.paths);
+            println!("  Path globs: {:?}", args.path_globs);
+            println!("  Path regexes: {:?}", args.path_regexes);
+            println!("  Invert paths: {}", args.invert_paths);
+            println!("  Use base name: {}", args.use_base_name);
+            println!("  Path renames: {:?}", args.path_renames);
+            println!("  Subdirectory filter: {:?}", args.subdirectory_filter);
+            println!("  To subdirectory filter: {:?}", args.to_subdirectory_filter);
+            println!("  Replace text file: {:?}", args.replace_text);
+            println!("  Strip blobs bigger than: {:?}", args.strip_blobs_bigger_than);
+            println!("  Tag renames: {:?}", args.tag_renames);
+            println!("  Force: {}", args.force);
+            println!("  Dry run: {}", args.dry_run);
         }
 
-        Ok(rules)
-    } else {
-        Ok(Vec::new())
+        filter_repository(&args)?;
     }
+
+    Ok(())
 }
 
-fn parse_replace_rule(line: &str) -> Result<ReplaceRule> {
-    let line = line.trim();
-
-    // Check for prefixes
-    let (rule_type, content) = if let Some(stripped) = line.strip_prefix("regex:") {
-        (ReplaceRuleType::Regex, stripped)
-    } else if let Some(stripped) = line.strip_prefix("glob:") {
-        (ReplaceRuleType::Glob, stripped)
-    } else {
-        (ReplaceRuleType::Literal, line)
-    };
-
-    // Split on ==> to separate pattern from replacement
-    let (pattern, replacement) = if let Some(pos) = content.find("==>") {
-        (&content[..pos], &content[pos + 3..])
-    } else {
-        (content, "***REMOVED***")
-    };
-
-    Ok(ReplaceRule {
-        rule_type,
-        pattern: pattern.to_string(),
-        replacement: replacement.to_string(),
-    })
+fn analyze_repository(args: &Args) -> Result<()> {
+    let report_dir = args.report_dir.as_deref().unwrap_or("GIT_DIR/filter_repo/analysis");
+    println!("Analyzing repository and writing report to {}", report_dir);
+    // Actual implementation would analyze the git repository
+    Ok(())
 }
 
-fn parse_size(size_str: &Option<String>) -> Result<Option<u64>> {
-    if let Some(size_str) = size_str {
-        let size = parse_size_unit(size_str)?;
-        Ok(Some(size))
-    } else {
-        Ok(None)
+fn filter_repository(args: &Args) -> Result<()> {
+    // In a real implementation, this would filter the repository
+    // using git2 crate to interact with Git repository
+    println!("Would filter repository based on provided options");
+
+    // Process the various filter options
+    if !args.paths.is_empty() {
+        println!("  Processing paths: {:?}", args.paths);
     }
-}
 
-fn parse_size_unit(size_str: &str) -> Result<u64> {
-    let size_str = size_str.trim();
-
-    if size_str.ends_with(['M', 'm']) {
-        let num: u64 = size_str[..size_str.len()-1].parse()?;
-        Ok(num * 1024 * 1024) // MB
-    } else if size_str.ends_with(['G', 'g']) {
-        let num: u64 = size_str[..size_str.len()-1].parse()?;
-        Ok(num * 1024 * 1024 * 1024) // GB
-    } else {
-        size_str.parse().map_err(|_| anyhow::anyhow!("Invalid size format"))
+    if !args.path_globs.is_empty() {
+        println!("  Processing path globs: {:?}", args.path_globs);
     }
-}
 
-fn process_repository_history(config: &FilterConfig) -> Result<()> {
-    println!("Processing repository history based on filter configuration...");
+    if !args.path_regexes.is_empty() {
+        println!("  Processing path regexes: {:?}", args.path_regexes);
+    }
 
-    // This is where the main filtering logic would go in a real implementation:
-    // 1. Walk through all commits in the repository
-    // 2. Apply filters to each commit
-    // 3. Create new tree objects with filtered content
-    // 4. Create new commit objects with the new trees
-    // 5. Update references to point to the new commits
+    if args.invert_paths {
+        println!("  Inverting path selection");
+    }
 
-    println!("Would process repository history with the following filters:");
-    println!("  Paths: {:?}", config.paths);
-    println!("  Path globs: {:?}", config.path_globs);
-    println!("  Path regexes: {:?}", config.path_regexes);
-    println!("  Invert paths: {}", config.invert_paths);
-    println!("  Use base name: {}", config.use_base_name);
-    println!("  Path renames: {:?}", config.path_renames);
-    println!("  Subdirectory filter: {:?}", config.subdirectory_filter);
-    println!("  To subdirectory filter: {:?}", config.to_subdirectory_filter);
-    println!("  Replace text rules: {} rules", config.replace_text_rules.len());
-    println!("  Strip blobs bigger than: {:?}", config.strip_blobs_bigger_than);
-    println!("  Tag renames: {:?}", config.tag_renames);
-    println!("  Prune empty: {}", config.prune_empty);
-    println!("  Preserve commit hashes: {}", config.preserve_commit_hashes);
+    if !args.path_renames.is_empty() {
+        println!("  Processing path renames: {:?}", args.path_renames);
+    }
+
+    if let Some(ref subdir) = args.subdirectory_filter {
+        println!("  Using subdirectory filter: {}", subdir);
+    }
+
+    if let Some(ref subdir) = args.to_subdirectory_filter {
+        println!("  Using to-subdirectory filter: {}", subdir);
+    }
+
+    if args.dry_run {
+        println!("  DRY RUN MODE - No changes will be made");
+    }
 
     Ok(())
 }
